@@ -21,6 +21,10 @@ for version in "${versions[@]}"; do
 	distro="${version%-*}"
 	suite="${version##*-}"
 	from="${distro}:${suite}"
+	installer=yum
+	if [[ "$distro" == "fedora" ]] && [[ "$suite" -ge "22" ]]; then
+		installer=dnf
+	fi
 
 	mkdir -p "$version"
 	echo "$version -> FROM $from"
@@ -38,9 +42,21 @@ for version in "${versions[@]}"; do
 		centos:*)
 			# get "Development Tools" packages dependencies
 			echo 'RUN yum groupinstall -y "Development Tools"' >> "$version/Dockerfile"
+
+			if [[ "$version" == "centos-7" ]]; then
+				echo 'RUN yum -y swap -- remove systemd-container systemd-container-libs -- install systemd systemd-libs' >> "$version/Dockerfile"
+			fi
+			;;
+		oraclelinux:*)
+			# get "Development Tools" packages and dependencies
+			echo 'RUN yum groupinstall -y "Development Tools"' >> "$version/Dockerfile"
+			;;
+		opensuse:*)
+			# get rpm-build and curl packages and dependencies
+			echo 'RUN zypper --non-interactive install ca-certificates* curl gzip rpm-build' >> "$version/Dockerfile"
 			;;
 		*)
-			echo 'RUN yum install -y @development-tools fedora-packager' >> "$version/Dockerfile"
+			echo "RUN ${installer} install -y @development-tools fedora-packager" >> "$version/Dockerfile"
 			;;
 	esac
 
@@ -50,10 +66,30 @@ for version in "${versions[@]}"; do
 		device-mapper-devel # for "libdevmapper.h"
 		glibc-static
 		libselinux-devel # for "libselinux.so"
+		libtool-ltdl-devel # for pkcs11 "ltdl.h"
+		selinux-policy
+		selinux-policy-devel
 		sqlite-devel # for "sqlite3.h"
-		tar # older versions of dev-tools don't have tar
+		tar # older versions of dev-tools do not have tar
 	)
-	echo "RUN yum install -y ${packages[*]}" >> "$version/Dockerfile"
+
+	case "$from" in
+		oraclelinux:7)
+			# Enable the optional repository
+			packages=( --enablerepo=ol7_optional_latest "${packages[*]}" )
+			;;
+	esac
+
+	case "$from" in
+		opensuse:*)
+			packages=( "${packages[@]/btrfs-progs-devel/libbtrfs-devel}" )
+			# use zypper
+			echo "RUN zypper --non-interactive install ${packages[*]}" >> "$version/Dockerfile"
+			;;
+		*)
+			echo "RUN ${installer} install -y ${packages[*]}" >> "$version/Dockerfile"
+			;;
+	esac
 
 	echo >> "$version/Dockerfile"
 
@@ -65,9 +101,5 @@ for version in "${versions[@]}"; do
 
 	echo 'ENV AUTO_GOPATH 1' >> "$version/Dockerfile"
 
-	if [ "$from" == "centos:6" ]; then
-		echo 'ENV DOCKER_BUILDTAGS selinux exclude_graphdriver_btrfs' >> "$version/Dockerfile"
-	else
-		echo 'ENV DOCKER_BUILDTAGS selinux' >> "$version/Dockerfile"
-	fi
+	echo 'ENV DOCKER_BUILDTAGS selinux' >> "$version/Dockerfile"
 done

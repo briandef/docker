@@ -46,22 +46,22 @@ echo
 DEFAULT_BUNDLES=(
 	validate-dco
 	validate-gofmt
+	validate-lint
+	validate-pkg
 	validate-test
 	validate-toml
 	validate-vet
 
 	binary
+	dynbinary
 
 	test-unit
 	test-integration-cli
 	test-docker-py
 
-	dynbinary
-
 	cover
 	cross
 	tgz
-	ubuntu
 )
 
 VERSION=$(< ./VERSION)
@@ -70,6 +70,7 @@ if command -v git &> /dev/null && git rev-parse &> /dev/null; then
 	if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 		GITCOMMIT="$GITCOMMIT-dirty"
 	fi
+	BUILDTIME=$(date -u)
 elif [ "$DOCKER_GITCOMMIT" ]; then
 	GITCOMMIT="$DOCKER_GITCOMMIT"
 else
@@ -93,18 +94,23 @@ if [ ! "$GOPATH" ]; then
 	exit 1
 fi
 
-if [ -z "$DOCKER_CLIENTONLY" ]; then
-	DOCKER_BUILDTAGS+=" daemon"
+if [ "$DOCKER_EXPERIMENTAL" ] || [ "$DOCKER_REMAP_ROOT" ]; then
+	echo >&2 '# WARNING! DOCKER_EXPERIMENTAL is set: building experimental features'
+	echo >&2
+	DOCKER_BUILDTAGS+=" experimental pkcs11"
 fi
 
-if [ "$DOCKER_EXECDRIVER" = 'lxc' ]; then
-	DOCKER_BUILDTAGS+=' test_no_exec'
+if [ -z "$DOCKER_CLIENTONLY" ]; then
+	DOCKER_BUILDTAGS+=" daemon"
+	if pkg-config libsystemd-journal 2> /dev/null ; then
+		DOCKER_BUILDTAGS+=" journald"
+	fi
 fi
 
 # test whether "btrfs/version.h" exists and apply btrfs_noversion appropriately
 if \
 	command -v gcc &> /dev/null \
-	&& ! gcc -E - &> /dev/null <<<'#include <btrfs/version.h>' \
+	&& ! gcc -E - -o /dev/null &> /dev/null <<<'#include <btrfs/version.h>' \
 ; then
 	DOCKER_BUILDTAGS+=' btrfs_noversion'
 fi
@@ -113,7 +119,7 @@ fi
 # functionality.
 if \
 	command -v gcc &> /dev/null \
-	&& ! ( echo -e  '#include <libdevmapper.h>\nint main() { dm_task_deferred_remove(NULL); }'| gcc -ldevmapper -xc - &> /dev/null ) \
+	&& ! ( echo -e  '#include <libdevmapper.h>\nint main() { dm_task_deferred_remove(NULL); }'| gcc -ldevmapper -xc - -o /dev/null &> /dev/null ) \
 ; then
        DOCKER_BUILDTAGS+=' libdm_no_deferred_remove'
 fi
@@ -122,29 +128,24 @@ fi
 
 IAMSTATIC='true'
 source "$SCRIPTDIR/make/.go-autogen"
-LDFLAGS='-w'
-
-LDFLAGS_STATIC='-linkmode external'
-# Cgo -H windows is incompatible with -linkmode external.
-if [ "$(go env GOOS)" == 'windows' ]; then
-	LDFLAGS_STATIC=''
+if [ -z "$DOCKER_DEBUG" ]; then
+	LDFLAGS='-w'
 fi
+
+LDFLAGS_STATIC=''
 EXTLDFLAGS_STATIC='-static'
 # ORIG_BUILDFLAGS is necessary for the cross target which cannot always build
 # with options like -race.
-ORIG_BUILDFLAGS=( -a -tags "netgo static_build $DOCKER_BUILDTAGS" -installsuffix netgo )
+ORIG_BUILDFLAGS=( -a -tags "autogen netgo static_build sqlite_omit_load_extension $DOCKER_BUILDTAGS" -installsuffix netgo )
 # see https://github.com/golang/go/issues/9369#issuecomment-69864440 for why -installsuffix is necessary here
 BUILDFLAGS=( $BUILDFLAGS "${ORIG_BUILDFLAGS[@]}" )
 # Test timeout.
-: ${TIMEOUT:=30m}
+: ${TIMEOUT:=120m}
 TESTFLAGS+=" -test.timeout=${TIMEOUT}"
 
-# A few more flags that are specific just to building a completely-static binary (see hack/make/binary)
-# PLEASE do not use these anywhere else.
-EXTLDFLAGS_STATIC_DOCKER="$EXTLDFLAGS_STATIC -lpthread -Wl,--unresolved-symbols=ignore-in-object-files"
 LDFLAGS_STATIC_DOCKER="
 	$LDFLAGS_STATIC
-	-extldflags \"$EXTLDFLAGS_STATIC_DOCKER\"
+	-extldflags \"$EXTLDFLAGS_STATIC\"
 "
 
 if [ "$(uname -s)" = 'FreeBSD' ]; then
@@ -191,13 +192,13 @@ go_test_dir() {
 		# if our current go install has -cover, we want to use it :)
 		mkdir -p "$DEST/coverprofiles"
 		coverprofile="docker${dir#.}"
-		coverprofile="$DEST/coverprofiles/${coverprofile//\//-}"
+		coverprofile="$ABS_DEST/coverprofiles/${coverprofile//\//-}"
 		testcover=( -cover -coverprofile "$coverprofile" $coverpkg )
 	fi
 	(
-		export DEST
 		echo '+ go test' $TESTFLAGS "${DOCKER_PKG}${dir#.}"
 		cd "$dir"
+		export DEST="$ABS_DEST" # we're in a subshell, so this is safe -- our integration-cli tests need DEST, and "cd" screws it up
 		test_env go test ${testcover[@]} -ldflags "$LDFLAGS" "${BUILDFLAGS[@]}" $TESTFLAGS
 	)
 }
@@ -205,13 +206,15 @@ test_env() {
 	# use "env -i" to tightly control the environment variables that bleed into the tests
 	env -i \
 		DEST="$DEST" \
-		DOCKER_EXECDRIVER="$DOCKER_EXECDRIVER" \
 		DOCKER_GRAPHDRIVER="$DOCKER_GRAPHDRIVER" \
 		DOCKER_USERLANDPROXY="$DOCKER_USERLANDPROXY" \
 		DOCKER_HOST="$DOCKER_HOST" \
+		DOCKER_REMAP_ROOT="$DOCKER_REMAP_ROOT" \
+		DOCKER_REMOTE_DAEMON="$DOCKER_REMOTE_DAEMON" \
 		GOPATH="$GOPATH" \
-		HOME="$DEST/fake-HOME" \
+		HOME="$ABS_DEST/fake-HOME" \
 		PATH="$PATH" \
+		TEMP="$TEMP" \
 		TEST_DOCKERINIT_PATH="$TEST_DOCKERINIT_PATH" \
 		"$@"
 }
@@ -221,25 +224,6 @@ binary_extension() {
 	if [ "$(go env GOOS)" = 'windows' ]; then
 		echo -n '.exe'
 	fi
-}
-
-# This helper function walks the current directory looking for directories
-# holding certain files ($1 parameter), and prints their paths on standard
-# output, one per line.
-find_dirs() {
-	find . -not \( \
-		\( \
-			-path './vendor/*' \
-			-o -path './integration-cli/*' \
-			-o -path './contrib/*' \
-			-o -path './pkg/mflag/example/*' \
-			-o -path './.git/*' \
-			-o -path './bundles/*' \
-			-o -path './docs/*' \
-			-o -path './pkg/libcontainer/nsinit/*' \
-		\) \
-		-prune \
-	\) -name "$1" -print0 | xargs -0n1 dirname | sort -u
 }
 
 hash_files() {
@@ -264,11 +248,9 @@ hash_files() {
 }
 
 bundle() {
-	bundlescript=$1
-	bundle=$(basename $bundlescript)
-	echo "---> Making bundle: $bundle (in bundles/$VERSION/$bundle)"
-	mkdir -p "bundles/$VERSION/$bundle"
-	source "$bundlescript" "$(pwd)/bundles/$VERSION/$bundle"
+	local bundle="$1"; shift
+	echo "---> Making bundle: $(basename "$bundle") (in $DEST)"
+	source "$SCRIPTDIR/make/$bundle" "$@"
 }
 
 main() {
@@ -282,13 +264,8 @@ main() {
 	fi
 
 	if [ "$(go env GOHOSTOS)" != 'windows' ]; then
-		# Windows and symlinks don't get along well
-
-		if [ "$(go env GOHOSTOS)" != 'freebsd' ]; then
-			ln -sfT "$VERSION" bundles/latest
-		else 
-			ln -sfh "$VERSION" bundles/latest
-		fi
+		rm -f bundles/latest
+		ln -s "$VERSION" bundles/latest
 	fi
 
 	if [ $# -lt 1 ]; then
@@ -297,7 +274,14 @@ main() {
 		bundles=($@)
 	fi
 	for bundle in ${bundles[@]}; do
-		bundle "$SCRIPTDIR/make/$bundle"
+		export DEST="bundles/$VERSION/$(basename "$bundle")"
+		# Cygdrive paths don't play well with go build -o.
+		if [[ "$(uname -s)" == CYGWIN* ]]; then
+			export DEST="$(cygpath -mw "$DEST")"
+		fi
+		mkdir -p "$DEST"
+		ABS_DEST="$(cd "$DEST" && pwd -P)"
+		bundle "$bundle"
 		echo
 	done
 }

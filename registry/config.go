@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"strings"
 
+	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/opts"
 	flag "github.com/docker/docker/pkg/mflag"
@@ -21,36 +21,43 @@ type Options struct {
 }
 
 const (
-	// Only used for user auth + account creation
-	INDEXSERVER    = "https://index.docker.io/v1/"
-	REGISTRYSERVER = "https://registry-1.docker.io/v2/"
-	INDEXNAME      = "docker.io"
+	// DefaultNamespace is the default namespace
+	DefaultNamespace = "docker.io"
+	// DefaultRegistryVersionHeader is the name of the default HTTP header
+	// that carries Registry version info
+	DefaultRegistryVersionHeader = "Docker-Distribution-Api-Version"
 
-	// INDEXSERVER = "https://registry-stage.hub.docker.com/v1/"
+	// IndexServer is the v1 registry server used for user auth + account creation
+	IndexServer = DefaultV1Registry + "/v1/"
+	// IndexName is the name of the index
+	IndexName = "docker.io"
+
+	// NotaryServer is the endpoint serving the Notary trust server
+	NotaryServer = "https://notary.docker.io"
+
+	// IndexServer = "https://registry-stage.hub.docker.com/v1/"
 )
 
 var (
+	// ErrInvalidRepositoryName is an error returned if the repository name did
+	// not have the correct form
 	ErrInvalidRepositoryName = errors.New("Invalid repository name (ex: \"registry.domain.tld/myrepos\")")
-	emptyServiceConfig       = NewServiceConfig(nil)
-	validNamespaceChars      = regexp.MustCompile(`^([a-z0-9-_]*)$`)
-	validRepo                = regexp.MustCompile(`^([a-z0-9-_.]+)$`)
+
+	emptyServiceConfig = NewServiceConfig(nil)
+
+	// V2Only controls access to legacy registries.  If it is set to true via the
+	// command line flag the daemon will not attempt to contact v1 legacy registries
+	V2Only = false
 )
-
-func IndexServerAddress() string {
-	return INDEXSERVER
-}
-
-func IndexServerName() string {
-	return INDEXNAME
-}
 
 // InstallFlags adds command-line options to the top-level flag parser for
 // the current process.
-func (options *Options) InstallFlags() {
+func (options *Options) InstallFlags(cmd *flag.FlagSet, usageFn func(string) string) {
 	options.Mirrors = opts.NewListOpts(ValidateMirror)
-	flag.Var(&options.Mirrors, []string{"-registry-mirror"}, "Preferred Docker registry mirror")
+	cmd.Var(&options.Mirrors, []string{"-registry-mirror"}, usageFn("Preferred Docker registry mirror"))
 	options.InsecureRegistries = opts.NewListOpts(ValidateIndexName)
-	flag.Var(&options.InsecureRegistries, []string{"-insecure-registry"}, "Enable insecure registry communication")
+	cmd.Var(&options.InsecureRegistries, []string{"-insecure-registry"}, usageFn("Enable insecure registry communication"))
+	cmd.BoolVar(&V2Only, []string{"-disable-legacy-registry"}, false, "Do not contact legacy registries")
 }
 
 type netIPNet net.IPNet
@@ -74,6 +81,7 @@ func (ipnet *netIPNet) UnmarshalJSON(b []byte) (err error) {
 type ServiceConfig struct {
 	InsecureRegistryCIDRs []*netIPNet           `json:"InsecureRegistryCIDRs"`
 	IndexConfigs          map[string]*IndexInfo `json:"IndexConfigs"`
+	Mirrors               []string
 }
 
 // NewServiceConfig returns a new instance of ServiceConfig
@@ -95,6 +103,9 @@ func NewServiceConfig(options *Options) *ServiceConfig {
 	config := &ServiceConfig{
 		InsecureRegistryCIDRs: make([]*netIPNet, 0),
 		IndexConfigs:          make(map[string]*IndexInfo, 0),
+		// Hack: Bypass setting the mirrors to IndexConfigs since they are going away
+		// and Mirrors are only for the official registry anyways.
+		Mirrors: options.Mirrors.GetAll(),
 	}
 	// Split --insecure-registry into CIDR and registry-specific settings.
 	for _, r := range options.InsecureRegistries.GetAll() {
@@ -115,9 +126,9 @@ func NewServiceConfig(options *Options) *ServiceConfig {
 	}
 
 	// Configure public registry.
-	config.IndexConfigs[IndexServerName()] = &IndexInfo{
-		Name:     IndexServerName(),
-		Mirrors:  options.Mirrors.GetAll(),
+	config.IndexConfigs[IndexName] = &IndexInfo{
+		Name:     IndexName,
+		Mirrors:  config.Mirrors,
 		Secure:   true,
 		Official: true,
 	}
@@ -189,14 +200,14 @@ func ValidateMirror(val string) (string, error) {
 		return "", fmt.Errorf("Unsupported path/query/fragment at end of the URI")
 	}
 
-	return fmt.Sprintf("%s://%s/v1/", uri.Scheme, uri.Host), nil
+	return fmt.Sprintf("%s://%s/", uri.Scheme, uri.Host), nil
 }
 
 // ValidateIndexName validates an index name.
 func ValidateIndexName(val string) (string, error) {
 	// 'index.docker.io' => 'docker.io'
-	if val == "index."+IndexServerName() {
-		val = IndexServerName()
+	if val == "index."+IndexName {
+		val = IndexName
 	}
 	if strings.HasPrefix(val, "-") || strings.HasSuffix(val, "-") {
 		return "", fmt.Errorf("Invalid index name (%s). Cannot begin or end with a hyphen.", val)
@@ -206,42 +217,17 @@ func ValidateIndexName(val string) (string, error) {
 }
 
 func validateRemoteName(remoteName string) error {
-	var (
-		namespace string
-		name      string
-	)
-	nameParts := strings.SplitN(remoteName, "/", 2)
-	if len(nameParts) < 2 {
-		namespace = "library"
-		name = nameParts[0]
+
+	if !strings.Contains(remoteName, "/") {
 
 		// the repository name must not be a valid image ID
-		if err := image.ValidateID(name); err == nil {
-			return fmt.Errorf("Invalid repository name (%s), cannot specify 64-byte hexadecimal strings", name)
+		if err := image.ValidateID(remoteName); err == nil {
+			return fmt.Errorf("Invalid repository name (%s), cannot specify 64-byte hexadecimal strings", remoteName)
 		}
-	} else {
-		namespace = nameParts[0]
-		name = nameParts[1]
 	}
-	if !validNamespaceChars.MatchString(namespace) {
-		return fmt.Errorf("Invalid namespace name (%s). Only [a-z0-9-_] are allowed.", namespace)
-	}
-	if len(namespace) < 2 || len(namespace) > 255 {
-		return fmt.Errorf("Invalid namespace name (%s). Cannot be fewer than 2 or more than 255 characters.", namespace)
-	}
-	if strings.HasPrefix(namespace, "-") || strings.HasSuffix(namespace, "-") {
-		return fmt.Errorf("Invalid namespace name (%s). Cannot begin or end with a hyphen.", namespace)
-	}
-	if strings.Contains(namespace, "--") {
-		return fmt.Errorf("Invalid namespace name (%s). Cannot contain consecutive hyphens.", namespace)
-	}
-	if !validRepo.MatchString(name) {
-		return fmt.Errorf("Invalid repository name (%s), only [a-z0-9-_.] are allowed", name)
-	}
-	if strings.HasPrefix(name, "-") || strings.HasSuffix(name, "-") {
-		return fmt.Errorf("Invalid repository name (%s). Cannot begin or end with a hyphen.", name)
-	}
-	return nil
+
+	_, err := reference.WithName(remoteName)
+	return err
 }
 
 func validateNoSchema(reposName string) error {
@@ -254,15 +240,28 @@ func validateNoSchema(reposName string) error {
 
 // ValidateRepositoryName validates a repository name
 func ValidateRepositoryName(reposName string) error {
-	var err error
-	if err = validateNoSchema(reposName); err != nil {
-		return err
+	_, _, err := loadRepositoryName(reposName, true)
+	return err
+}
+
+// loadRepositoryName returns the repo name splitted into index name
+// and remote repo name. It returns an error if the name is not valid.
+func loadRepositoryName(reposName string, checkRemoteName bool) (string, string, error) {
+	if err := validateNoSchema(reposName); err != nil {
+		return "", "", err
 	}
 	indexName, remoteName := splitReposName(reposName)
-	if _, err = ValidateIndexName(indexName); err != nil {
-		return err
+
+	var err error
+	if indexName, err = ValidateIndexName(indexName); err != nil {
+		return "", "", err
 	}
-	return validateRemoteName(remoteName)
+	if checkRemoteName {
+		if err = validateRemoteName(remoteName); err != nil {
+			return "", "", err
+		}
+	}
+	return indexName, remoteName, nil
 }
 
 // NewIndexInfo returns IndexInfo configuration from indexName
@@ -292,7 +291,7 @@ func (config *ServiceConfig) NewIndexInfo(indexName string) (*IndexInfo, error) 
 // index as the AuthConfig key, and uses the (host)name[:port] for private indexes.
 func (index *IndexInfo) GetAuthConfigKey() string {
 	if index.Official {
-		return IndexServerAddress()
+		return IndexServer
 	}
 	return index.Name
 }
@@ -305,7 +304,7 @@ func splitReposName(reposName string) (string, string) {
 		!strings.Contains(nameParts[0], ":") && nameParts[0] != "localhost") {
 		// This is a Docker Index repos (ex: samalba/hipache or ubuntu)
 		// 'docker.io'
-		indexName = IndexServerName()
+		indexName = IndexName
 		remoteName = reposName
 	} else {
 		indexName = nameParts[0]
@@ -315,13 +314,9 @@ func splitReposName(reposName string) (string, string) {
 }
 
 // NewRepositoryInfo validates and breaks down a repository name into a RepositoryInfo
-func (config *ServiceConfig) NewRepositoryInfo(reposName string) (*RepositoryInfo, error) {
-	if err := validateNoSchema(reposName); err != nil {
-		return nil, err
-	}
-
-	indexName, remoteName := splitReposName(reposName)
-	if err := validateRemoteName(remoteName); err != nil {
+func (config *ServiceConfig) NewRepositoryInfo(reposName string, bySearch bool) (*RepositoryInfo, error) {
+	indexName, remoteName, err := loadRepositoryName(reposName, !bySearch)
+	if err != nil {
 		return nil, err
 	}
 
@@ -329,18 +324,13 @@ func (config *ServiceConfig) NewRepositoryInfo(reposName string) (*RepositoryInf
 		RemoteName: remoteName,
 	}
 
-	var err error
 	repoInfo.Index, err = config.NewIndexInfo(indexName)
 	if err != nil {
 		return nil, err
 	}
 
 	if repoInfo.Index.Official {
-		normalizedName := repoInfo.RemoteName
-		if strings.HasPrefix(normalizedName, "library/") {
-			// If pull "library/foo", it's stored locally under "foo"
-			normalizedName = strings.SplitN(normalizedName, "/", 2)[1]
-		}
+		normalizedName := normalizeLibraryRepoName(repoInfo.RemoteName)
 
 		repoInfo.LocalName = normalizedName
 		repoInfo.RemoteName = normalizedName
@@ -352,13 +342,13 @@ func (config *ServiceConfig) NewRepositoryInfo(reposName string) (*RepositoryInf
 			repoInfo.RemoteName = "library/" + normalizedName
 		}
 
-		// *TODO: Prefix this with 'docker.io/'.
-		repoInfo.CanonicalName = repoInfo.LocalName
+		repoInfo.CanonicalName = "docker.io/" + repoInfo.RemoteName
 	} else {
-		// *TODO: Decouple index name from hostname (via registry configuration?)
-		repoInfo.LocalName = repoInfo.Index.Name + "/" + repoInfo.RemoteName
+		repoInfo.LocalName = localNameFromRemote(repoInfo.Index.Name, repoInfo.RemoteName)
 		repoInfo.CanonicalName = repoInfo.LocalName
+
 	}
+
 	return repoInfo, nil
 }
 
@@ -374,15 +364,54 @@ func (repoInfo *RepositoryInfo) GetSearchTerm() string {
 // ParseRepositoryInfo performs the breakdown of a repository name into a RepositoryInfo, but
 // lacks registry configuration.
 func ParseRepositoryInfo(reposName string) (*RepositoryInfo, error) {
-	return emptyServiceConfig.NewRepositoryInfo(reposName)
+	return emptyServiceConfig.NewRepositoryInfo(reposName, false)
+}
+
+// ParseIndexInfo will use repository name to get back an indexInfo.
+func ParseIndexInfo(reposName string) (*IndexInfo, error) {
+	indexName, _ := splitReposName(reposName)
+
+	indexInfo, err := emptyServiceConfig.NewIndexInfo(indexName)
+	if err != nil {
+		return nil, err
+	}
+	return indexInfo, nil
 }
 
 // NormalizeLocalName transforms a repository name into a normalize LocalName
 // Passes through the name without transformation on error (image id, etc)
+// It does not use the repository info because we don't want to load
+// the repository index and do request over the network.
 func NormalizeLocalName(name string) string {
-	repoInfo, err := ParseRepositoryInfo(name)
+	indexName, remoteName, err := loadRepositoryName(name, true)
 	if err != nil {
 		return name
 	}
-	return repoInfo.LocalName
+
+	var officialIndex bool
+	// Return any configured index info, first.
+	if index, ok := emptyServiceConfig.IndexConfigs[indexName]; ok {
+		officialIndex = index.Official
+	}
+
+	if officialIndex {
+		return normalizeLibraryRepoName(remoteName)
+	}
+	return localNameFromRemote(indexName, remoteName)
+}
+
+// normalizeLibraryRepoName removes the library prefix from
+// the repository name for official repos.
+func normalizeLibraryRepoName(name string) string {
+	if strings.HasPrefix(name, "library/") {
+		// If pull "library/foo", it's stored locally under "foo"
+		name = strings.SplitN(name, "/", 2)[1]
+	}
+	return name
+}
+
+// localNameFromRemote combines the index name and the repo remote name
+// to generate a repo local name.
+func localNameFromRemote(indexName, remoteName string) string {
+	return indexName + "/" + remoteName
 }

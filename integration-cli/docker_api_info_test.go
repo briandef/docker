@@ -23,9 +23,12 @@ func (s *DockerSuite) TestInfoApi(c *check.C) {
 		"LoggingDriver",
 		"OperatingSystem",
 		"NCPU",
+		"OSType",
+		"Architecture",
 		"MemTotal",
 		"KernelVersion",
-		"Driver"}
+		"Driver",
+		"ServerVersion"}
 
 	out := string(body)
 	for _, linePrefix := range stringsToCheck {

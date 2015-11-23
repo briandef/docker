@@ -3,22 +3,34 @@ package tags
 import (
 	"fmt"
 	"regexp"
+
+	"github.com/docker/distribution/reference"
 )
 
-const DEFAULTTAG = "latest"
+// DefaultTag defines the default tag used when performing images related actions and no tag string is specified
+const DefaultTag = "latest"
 
-var (
-	//FIXME this regex also exists in registry/v2/regexp.go
-	validTagName = regexp.MustCompile(`^[\w][\w.-]{0,127}$`)
-)
+var anchoredTagRegexp = regexp.MustCompile(`^` + reference.TagRegexp.String() + `$`)
 
-// ValidateTagName validates the name of a tag
+// ErrTagInvalidFormat is returned if tag is invalid.
+type ErrTagInvalidFormat struct {
+	name string
+}
+
+func (e ErrTagInvalidFormat) Error() string {
+	return fmt.Sprintf("Illegal tag name (%s): only [A-Za-z0-9_.-] are allowed ('.' and '-' are NOT allowed in the initial), minimum 1, maximum 128 in length", e.name)
+}
+
+// ValidateTagName validates the name of a tag.
+// It returns an error if the given name is an emtpy string.
+// If name is not valid, it returns ErrTagInvalidFormat
 func ValidateTagName(name string) error {
 	if name == "" {
 		return fmt.Errorf("tag name can't be empty")
 	}
-	if !validTagName.MatchString(name) {
-		return fmt.Errorf("Illegal tag name (%s): only [A-Za-z0-9_.-] are allowed, minimum 1, maximum 128 in length", name)
+
+	if !anchoredTagRegexp.MatchString(name) {
+		return ErrTagInvalidFormat{name}
 	}
 	return nil
 }
